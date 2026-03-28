@@ -218,3 +218,16 @@ class LogCache:
                 log for log in self._cache
                 if log.transaction_hash.lower() == transaction_hash.lower()
             ]
+    
+    def get_unique_topics(self) -> List[str]:
+        """Get unique event topics from cached logs.
+        
+        Returns:
+            List of unique first topics (event signatures)
+        """
+        with self._lock:
+            topics = set()
+            for log in self._cache:
+                if log.topics:
+                    topics.add(log.topics[0])
+            return sorted(list(topics))

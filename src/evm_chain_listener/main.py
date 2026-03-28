@@ -4,12 +4,17 @@ import argparse
 import asyncio
 import signal
 import sys
-from typing import List
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import List, Optional
 
-from aiohttp import web
+import uvicorn
+from fastapi import FastAPI, Query, Request
+from fastapi.responses import HTMLResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
 
-from .api.handlers import APIHandler
-from .api.routes import create_app
 from .cache.log_cache import LogCache
 from .chains.base import ChainListener
 from .config import load_config
@@ -18,130 +23,222 @@ from .utils.logging import get_logger, setup_logging
 
 logger = get_logger(__name__)
 
+# Global state
+_cache: Optional[LogCache] = None
+_listeners: List[ChainListener] = []
+_config: Optional[AppConfig] = None
 
-class Application:
-    """Main application class."""
-    
-    def __init__(self, config_path: str):
-        """Initialize the application.
-        
-        Args:
-            config_path: Path to configuration file
-        """
-        self._config = load_config(config_path)
-        self._cache = LogCache(self._config.cache)
-        self._listeners: List[ChainListener] = []
-        self._running = False
-        self._app = None
-        self._api_task = None
-    
-    def _on_logs_received(self, logs: List[Log]) -> None:
-        """Callback when new logs are received.
-        
-        Args:
-            logs: List of received logs
-        """
-        added = self._cache.add_many(logs)
+
+def _on_logs_received(logs: List[Log]) -> None:
+    """Callback when new logs are received."""
+    global _cache
+    if _cache:
+        added = _cache.add_many(logs)
         logger.debug(f"Added {added} logs to cache")
-    
-    def _create_listeners(self) -> None:
-        """Create chain listeners from configuration."""
-        for chain_config in self._config.chains:
-            listener = ChainListener(
-                config=chain_config,
-                log_callback=self._on_logs_received,
-            )
-            self._listeners.append(listener)
-            logger.info(
-                f"Created listener for {chain_config.name} "
-                f"(chain_id={chain_config.chain_id})"
-            )
-    
-    async def _start_api_server(self) -> None:
-        """Start the API server."""
-        handler = APIHandler(
-            cache=self._cache,
-            listeners=self._listeners,
-            config=self._config.api,
-            version="1.0.0",
+
+
+def _create_listeners() -> None:
+    """Create chain listeners from configuration."""
+    global _listeners, _config
+    for chain_config in _config.chains:
+        listener = ChainListener(
+            config=chain_config,
+            log_callback=_on_logs_received,
         )
-        self._app = create_app(handler)
-        
-        runner = web.AppRunner(self._app)
-        await runner.setup()
-        
-        site = web.TCPSite(
-            runner,
-            host=self._config.api.host,
-            port=self._config.api.port,
-        )
-        await site.start()
-        
+        _listeners.append(listener)
         logger.info(
-            f"API server started on {self._config.api.host}:{self._config.api.port}"
+            f"Created listener for {chain_config.name} "
+            f"(chain_id={chain_config.chain_id})"
         )
-    
-    async def _start(self) -> None:
-        """Start the application."""
-        self._running = True
-        
-        self._create_listeners()
-        
-        for listener in self._listeners:
-            await listener.start()
-        
-        await self._start_api_server()
-        
-        logger.info("Application started successfully")
-    
-    async def _stop(self) -> None:
-        """Stop the application gracefully."""
-        if not self._running:
-            return
-        
-        logger.info("Shutting down application...")
-        self._running = False
-        
-        for listener in self._listeners:
-            await listener.stop()
-        
-        logger.info("Application stopped")
-    
-    async def run(self) -> None:
-        """Run the application."""
-        loop = asyncio.get_running_loop()
-        
-        stop_event = asyncio.Event()
-        
-        def signal_handler():
-            logger.info("Received shutdown signal")
-            stop_event.set()
-        
-        for sig in (signal.SIGTERM, signal.SIGINT):
-            loop.add_signal_handler(sig, signal_handler)
-        
-        try:
-            await self._start()
-            await stop_event.wait()
-        except asyncio.CancelledError:
-            pass
-        finally:
-            await self._stop()
 
 
-async def async_main(config_path: str) -> None:
-    """Async main entry point.
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Application lifespan manager."""
+    global _cache, _listeners, _config
     
-    Args:
-        config_path: Path to configuration file
-    """
-    app = Application(config_path)
-    await app.run()
+    # Startup
+    logger.info("Starting application...")
+    _cache = LogCache(_config.cache)
+    _create_listeners()
+    
+    for listener in _listeners:
+        await listener.start()
+    
+    logger.info("Application started successfully")
+    
+    yield
+    
+    # Shutdown
+    logger.info("Shutting down application...")
+    for listener in _listeners:
+        await listener.stop()
+    logger.info("Application stopped")
+
+
+# Create FastAPI app
+app = FastAPI(
+    title="EVM Chain Listener",
+    description="Lightweight EVM-compatible chain log listener",
+    version="1.0.0",
+    lifespan=lifespan,
+)
+
+# Setup templates
+templates_path = Path(__file__).parent / "templates"
+templates = Jinja2Templates(directory=str(templates_path))
+
+
+# API Routes
+@app.get("/", response_class=HTMLResponse)
+async def index(request: Request):
+    """Render the main page."""
+    return templates.TemplateResponse(request, "index.html", {})
+
+
+@app.get("/api/logs")
+async def get_logs(
+    chain_id: Optional[int] = Query(None, description="Filter by chain ID"),
+    from_block: Optional[int] = Query(None, description="Minimum block number"),
+    to_block: Optional[int] = Query(None, description="Maximum block number"),
+    from_time: Optional[str] = Query(None, description="Start time (ISO8601)"),
+    to_time: Optional[str] = Query(None, description="End time (ISO8601)"),
+    address: Optional[str] = Query(None, description="Contract address"),
+    topic: Optional[str] = Query(None, description="Event topic (first topic)"),
+    page: int = Query(1, ge=1, description="Page number"),
+    page_size: int = Query(100, ge=1, le=1000, description="Items per page"),
+):
+    """Query logs from cache with filters."""
+    global _cache
+    
+    from_time_dt = None
+    to_time_dt = None
+    
+    if from_time:
+        from_time_dt = datetime.fromisoformat(from_time.replace("Z", "+00:00"))
+    if to_time:
+        to_time_dt = datetime.fromisoformat(to_time.replace("Z", "+00:00"))
+    
+    result = _cache.query(
+        chain_id=chain_id,
+        from_block=from_block,
+        to_block=to_block,
+        from_time=from_time_dt,
+        to_time=to_time_dt,
+        address=address,
+        page=page,
+        page_size=page_size,
+    )
+    
+    # Apply topic filter if specified
+    logs = result.items
+    if topic:
+        logs = [log for log in logs if log.topics and log.topics[0] == topic]
+    
+    return {
+        "status": "success",
+        "data": {
+            "logs": [log.to_dict() for log in logs],
+            "pagination": {
+                "page": result.page,
+                "page_size": result.page_size,
+                "total": result.total,
+                "total_pages": result.total_pages,
+            }
+        }
+    }
+
+
+@app.get("/api/logs/stats")
+async def get_logs_stats():
+    """Get cache statistics."""
+    global _cache
+    stats = _cache.get_stats()
+    return {
+        "status": "success",
+        "data": stats.to_dict()
+    }
+
+
+@app.get("/api/logs/topics")
+async def get_unique_topics():
+    """Get unique event topics from cached logs."""
+    global _cache
+    topics = _cache.get_unique_topics()
+    return {
+        "status": "success",
+        "data": {"topics": topics}
+    }
+
+
+@app.get("/api/chains")
+async def get_chains():
+    """Get list of configured chains and their status."""
+    global _listeners
+    chains = []
+    for listener in _listeners:
+        status = listener.status
+        chains.append({
+            "name": status.name,
+            "chain_id": status.chain_id,
+            "status": status.status,
+            "last_block": status.last_block,
+            "last_poll": status.last_poll.isoformat() if status.last_poll else None,
+        })
+    return {
+        "status": "success",
+        "data": {"chains": chains}
+    }
+
+
+@app.get("/health")
+async def health_check():
+    """Health check endpoint."""
+    global _listeners
+    
+    uptime = 0
+    chain_statuses = {}
+    
+    for listener in _listeners:
+        status = listener.status
+        chain_statuses[status.name] = {
+            "status": status.status,
+            "last_block": status.last_block,
+            "last_poll": status.last_poll.isoformat() if status.last_poll else None,
+        }
+    
+    healthy = all(l.status.status == "running" for l in _listeners)
+    
+    rpc_nodes = {}
+    for listener in _listeners:
+        node_status = await listener._rpc_pool.health_check()
+        rpc_nodes[listener.name] = node_status.to_dict()
+    
+    return {
+        "status": "healthy" if healthy else "degraded",
+        "version": "1.0.0",
+        "chains": chain_statuses,
+        "rpc_nodes": rpc_nodes,
+    }
+
+
+@app.get("/ready")
+async def readiness_check():
+    """Readiness check endpoint."""
+    global _listeners
+    checks = {
+        "config_loaded": True,
+        "rpc_nodes_configured": len(_listeners) > 0,
+    }
+    return {
+        "ready": all(checks.values()),
+        "checks": checks,
+    }
 
 
 def main() -> None:
     """Main entry point."""
-    import argparse
+    global _config
     
     parser = argparse.ArgumentParser(
         description="EVM Chain Listener - Lightweight EVM-compatible chain log listener"
@@ -156,6 +253,17 @@ def main() -> None:
         action="version",
         version="%(prog)s 1.0.0"
     )
+    parser.add_argument(
+        "--host",
+        default=None,
+        help="Override API host"
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=None,
+        help="Override API port"
+    )
     
     args = parser.parse_args()
     
@@ -165,14 +273,20 @@ def main() -> None:
         output="stdout",
     )
     
-    try:
-        asyncio.run(async_main(args.config))
-    except KeyboardInterrupt:
-        logger.info("Interrupted by user")
-        sys.exit(0)
-    except Exception as e:
-        logger.error(f"Application error: {e}")
-        sys.exit(1)
+    # Load configuration
+    _config = load_config(args.config)
+    
+    host = args.host or _config.api.host
+    port = args.port or _config.api.port
+    
+    logger.info(f"Starting server on {host}:{port}")
+    
+    uvicorn.run(
+        app,
+        host=host,
+        port=port,
+        log_config=None,  # Use our own logging
+    )
 
 
 if __name__ == "__main__":
