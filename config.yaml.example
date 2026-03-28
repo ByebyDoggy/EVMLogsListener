@@ -1,0 +1,61 @@
+chains:
+  - name: ethereum
+    chain_id: 1
+    poll_interval: 30
+    rpc_nodes:
+      - url: "${ALCHEMY_ETH_URL}"
+        priority: 1
+        type: alchemy
+        rate_limit:
+          requests_per_second: 10
+          burst: 20
+      - url: "${INFURA_ETH_URL}"
+        priority: 2
+        type: infura
+        rate_limit:
+          requests_per_second: 10
+          burst: 20
+      - url: "https://eth.public-rpc.com"
+        priority: 3
+        type: public
+        rate_limit:
+          requests_per_second: 1
+          burst: 5
+
+  - name: bsc
+    chain_id: 56
+    poll_interval: 30
+    rpc_nodes:
+      - url: "${BSC_RPC_URL}"
+        priority: 1
+        type: paid
+        rate_limit:
+          requests_per_second: 5
+          burst: 10
+
+  - name: polygon
+    chain_id: 137
+    poll_interval: 30
+    rpc_nodes:
+      - url: "${POLYGON_RPC_URL}"
+        priority: 1
+        type: paid
+        rate_limit:
+          requests_per_second: 5
+          burst: 10
+
+cache:
+  max_size: 10000
+
+api:
+  host: "0.0.0.0"
+  port: 8080
+
+log:
+  level: INFO
+  format: json
+  output: stdout
+
+health:
+  enabled: true
+  endpoint: /health

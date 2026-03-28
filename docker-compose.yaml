@@ -1,0 +1,15 @@
+version: '3.8'
+
+services:
+  evm-listener:
+    build: .
+    environment:
+      - ALCHEMY_ETH_URL=${ALCHEMY_ETH_URL}
+      - INFURA_ETH_URL=${INFURA_ETH_URL}
+      - BSC_RPC_URL=${BSC_RPC_URL}
+      - POLYGON_RPC_URL=${POLYGON_RPC_URL}
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
