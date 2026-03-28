@@ -1,0 +1,51 @@
+chains:
+  - name: ethereum
+    chain_id: 1
+    poll_interval: 30
+    rpc_nodes:
+      - url: "https://ethereum-rpc.publicnode.com"
+        priority: 1
+        type: public
+        rate_limit:
+          requests_per_second: 5
+          burst: 10
+      - url: "https://1rpc.io/eth"
+        priority: 2
+        type: public
+        rate_limit:
+          requests_per_second: 5
+          burst: 10
+      - url: "https://cloudflare-eth.com"
+        priority: 3
+        type: public
+        rate_limit:
+          requests_per_second: 2
+          burst: 5
+      - url: "https://eth.drpc.org"
+        priority: 4
+        type: public
+        rate_limit:
+          requests_per_second: 5
+          burst: 10
+      - url: "https://rpc.ankr.com/eth"
+        priority: 5
+        type: public
+        rate_limit:
+          requests_per_second: 5
+          burst: 10
+
+cache:
+  max_size: 10000
+
+api:
+  host: "0.0.0.0"
+  port: 8080
+
+log:
+  level: INFO
+  format: json
+  output: stdout
+
+health:
+  enabled: true
+  endpoint: /health
