@@ -15,16 +15,14 @@ chains:
         type: string       # 节点类型: "public" | "paid" | "alchemy" | "infura"
     rate_limit:
       requests_per_second: integer  # 该节点每秒最大请求数
-      burst: integer                # 突发容量
+        burst: integer                # 突发容量
 
-webhook:
-  endpoints:
-    - url: string         # Webhook接收URL
-      timeout: integer    # 请求超时（秒），默认10
-      retry_times: integer # 重试次数，默认3
-      retry_delay: integer # 重试间隔（秒），默认5
-      headers:             # 自定义请求头
-        Authorization: string
+cache:
+  max_size: integer        # 缓存最大日志条数，默认10000
+
+api:
+  host: string             # API服务监听地址，默认"0.0.0.0"
+  port: integer            # API服务监听端口，默认8080
 
 log:
   level: string           # 日志级别: DEBUG | INFO | WARNING | ERROR
@@ -34,8 +32,8 @@ log:
 
 health:
   enabled: boolean        # 是否启用健康检查
-  port: integer           # 健康检查端口
-  endpoint: string        # 健康检查路径
+  endpoint: string        # 健康检查路径，默认/health
+```
 ```
 
 ### 环境变量
@@ -50,85 +48,82 @@ health:
 
 ## Webhook接口
 
-### 日志事件推送
+## 日志查询接口
 
-**请求**
+### GET /logs
 
-```http
-POST /events HTTP/1.1
-Host: your-webhook.com
-Content-Type: application/json
-X-Signature: sha256=xxx  # 可选，HMAC签名
-X-Chain-ID: 1
-X-Request-ID: uuid
+查询缓存的日志。
 
-{
-  "version": "1.0",
-  "timestamp": "2024-01-15T10:30:00Z",
-  "chain": {
-    "name": "ethereum",
-    "chain_id": 1
-  },
-  "logs": [
-    {
-      "log_index": "0x1a",
-      "transaction_hash": "0xabc123...",
-      "transaction_index": "0x5",
-      "block_number": "0x12345678",
-      "block_hash": "0xdef456...",
-      "address": "0xContractAddress",
-      "data": "0x...",
-      "topics": [
-        "0xEventSignatureHash",
-        "0xArg1",
-        "0xArg2"
-      ],
-      "removed": false
-    }
-  ],
-  "from_block": "0x12345670",
-  "to_block": "0x12345678",
-  "count": 15
-}
-```
+**请求参数**
+
+| 参数 | 类型 | 必填 | 描述 |
+|------|------|------|------|
+| chain_id | integer | 否 | 按链ID过滤 |
+| from_block | integer | 否 | 起始区块号 |
+| to_block | integer | 否 | 结束区块号 |
+| from_time | string | 否 | 起始时间（ISO8601格式） |
+| to_time | string | 否 | 结束时间（ISO8601格式） |
+| address | string | 否 | 按合约地址过滤 |
+| page | integer | 否 | 页码（默认1） |
+| page_size | integer | 否 | 每页条数（默认100，最大1000） |
 
 **响应**
 
-```http
-HTTP/1.1 200 OK
-Content-Type: application/json
-
+```json
 {
   "status": "success",
-  "request_id": "uuid"
+  "data": {
+    "logs": [
+      {
+        "chain_id": 1,
+        "chain_name": "ethereum",
+        "log_index": "0x1a",
+        "transaction_hash": "0xabc123...",
+        "transaction_index": "0x5",
+        "block_number": "0x12345678",
+        "block_hash": "0xdef456...",
+        "address": "0xContractAddress",
+        "data": "0x...",
+        "topics": [
+          "0xEventSignatureHash",
+          "0xArg1",
+          "0xArg2"
+        ],
+        "removed": false,
+        "timestamp": "2024-01-15T10:30:00Z"
+      }
+    ],
+    "pagination": {
+      "page": 1,
+      "page_size": 100,
+      "total": 1500,
+      "total_pages": 15
+    }
+  }
 }
 ```
 
-### 错误推送
+### GET /logs/stats
 
-**请求**
+获取缓存统计信息。
 
-```http
-POST /events HTTP/1.1
-Content-Type: application/json
-X-Event-Type: error
+**响应**
 
+```json
 {
-  "version": "1.0",
-  "timestamp": "2024-01-15T10:30:00Z",
-  "event_type": "error",
-  "chain": {
-    "name": "ethereum",
-    "chain_id": 1
-  },
-  "error": {
-    "code": "RATE_LIMIT_EXCEEDED",
-    "message": "RPC node rate limit exceeded",
-    "details": {
-      "node_url": "https://eth.public-rpc.com",
-      "retry_after": 5
-    }
+  "status": "success",
+  "data": {
+    "total_logs": 8500,
+    "max_size": 10000,
+    "by_chain": {
+      "1": 5000,
+      "56": 2500,
+      "137": 1000
+    },
+    "oldest_log_timestamp": "2024-01-15T08:00:00Z",
+    "newest_log_timestamp": "2024-01-15T10:30:00Z"
   }
+}
 }
 ```
 
@@ -174,8 +169,7 @@ X-Event-Type: error
   "ready": true,
   "checks": {
     "config_loaded": true,
-    "rpc_nodes_configured": true,
-    "webhook_configured": true
+    "rpc_nodes_configured": true
   }
 }
 ```

@@ -123,7 +123,23 @@ EVM Chain Listener是一个轻量级的后台服务，用于监控EVM兼容链�
 4. WHEN 配置文件 SHALL 支持日志级别设置（DEBUG/INFO/WARNING/ERROR）
 5. WHEN 日志输出 SHALL 支持JSON格式
 
-### 需求10：优雅关闭
+### 需求10：日志缓存
+
+**用户故事：** AS 开发者，我需要 将获取的日志缓存在本地内存，以便 外部系统通过查询接口获取日志
+
+#### Acceptance Criteria
+
+1. WHEN 系统 SHALL 使用内存缓存存储获取到的日志
+2. WHEN 缓存 SHALL 使用FIFO（先进先出）策略
+3. WHEN 缓存大小 SHALL 可配置（默认max_size=10000条日志）
+4. WHEN 当缓存达到max_size时，THEN 系统 SHALL 自动清除最旧的日志
+5. WHEN 缓存 SHALL 支持按链ID过滤查询
+6. WHEN 缓存 SHALL 支持按时间范围过滤查询
+7. WHEN 缓存 SHALL 支持分页查询
+8. WHEN 系统 SHALL 提供HTTP查询接口获取缓存的日志
+9. WHEN 日志 SHALL 支持按 log_index 或 transaction_hash 去重
+
+### 需求11：优雅关闭
 
 **用户故事：** AS 系统，我需要 优雅关闭机制，以便 避免中断处理中的请求
 

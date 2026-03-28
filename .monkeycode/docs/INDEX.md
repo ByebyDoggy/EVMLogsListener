@@ -12,7 +12,7 @@ EVM Chain Listener 是一个后台服务，用于监控EVM兼容链（Ethereum�
 - **多RPC节点冗余**：支持配置多个RPC节点，自动故障切换
 - **智能轮询**：可配置查询间隔（15s/30s/60s），避免API限流
 - **二分法补全**：日志量超限时自动使用二分法拆分查询
-- **Webhook通知**：日志事件实时推送到指定Webhook endpoint
+- **HTTP查询API**：缓存日志可通过REST API查询
 - **Docker部署**：一键Docker部署，开箱即用
 
 ## 技术栈
