@@ -136,5 +136,5 @@ chains:
         config_file = tmp_path / "config.yaml"
         config_file.write_text(config_content)
         
-        with pytest.raises(ConfigError, match="At least one RPC node is required"):
+        with pytest.raises(ConfigError, match="At least one RPC node or apipool_urls is required"):
             load_config(str(config_file))

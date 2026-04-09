@@ -2,6 +2,7 @@ chains:
   - name: ethereum
     chain_id: 1
     poll_interval: 30
+    # --- Option A: legacy RPC node pool (per-node priority, rate limit) ---
     rpc_nodes:
       - url: "https://ethereum-rpc.publicnode.com"
         priority: 1
@@ -33,6 +34,13 @@ chains:
         rate_limit:
           requests_per_second: 5
           burst: 10
+    # --- Option B: apipool-ng load balancing (simpler, random round-robin + auto-eviction) ---
+    # apipool_urls:                    # Uncomment to use instead of rpc_nodes
+    #   - "https://ethereum-rpc.publicnode.com"
+    #   - "https://1rpc.io/eth"
+    #   - "https://cloudflare-eth.com"
+    #   - "https://eth.drpc.org"
+    #   - "https://rpc.ankr.com/eth"
 
 cache:
   max_size: 10000
@@ -49,3 +57,41 @@ log:
 health:
   enabled: true
   endpoint: /health
+
+alert_processor:
+  enabled: true
+  url: "http://localhost:8000"
+  push_interval_seconds: 5
+  batch_size: 200
+  max_payload_mb: 10
+  retry_attempts: 3
+  retry_base_delay_sec: 1
+  timeout_seconds: 10
+  reconnect_check_on_startup: true
+  replay_endpoint: "/ingest/logs/replay"
+
+# --- Log Recorder: save logs to local JSONL files ---
+# Enable in realtime or backtest mode to record all incoming logs.
+# Recorded files can later be replayed via the `replay` config.
+recorder:
+  enabled: true                       # Set true to enable recording
+  directory: "./recordings"            # Directory for JSONL files
+
+# --- Log Replay: load logs from local files instead of RPC ---
+# Only used in backtest mode. When configured, backtest will read logs
+# from local files instead of querying RPC nodes.
+# replay:
+#   file_path: "./recordings/ethereum_20260409_120000.jsonl"  # Single file mode
+#   # OR directory mode (auto-discovers recordings):
+#   # directory: "./recordings"
+#   from_block: null                    # Optional block range filter
+#   to_block: null
+
+# --- Backtest Startup Config ---
+# Only used in backtest mode. When from_block/to_block are set, a backtest
+# task is automatically submitted on startup for each configured chain.
+# Can also be set via CLI: --from-block and --to-block (CLI overrides config).
+# backtest:
+#   from_block: 19000000              # Starting block (inclusive)
+#   to_block: 19002000                # Ending block (inclusive)
+#   batch_size: 1000                  # Blocks per batch query

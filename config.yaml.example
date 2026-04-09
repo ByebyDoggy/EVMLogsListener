@@ -59,3 +59,28 @@ log:
 health:
   enabled: true
   endpoint: /health
+
+alert_processor:
+  enabled: false
+  url: "http://localhost:8000"
+  push_interval_seconds: 5
+  batch_size: 200
+  max_payload_mb: 10
+  retry_attempts: 3
+  retry_base_delay_sec: 1
+  timeout_seconds: 10
+  reconnect_check_on_startup: true
+  replay_endpoint: "/ingest/logs/replay"
+
+recorder:
+  enabled: false
+  directory: "./recordings"
+
+# --- Backtest Startup Config ---
+# Only used in backtest mode. When from_block/to_block are set, a backtest
+# task is automatically submitted on startup for each configured chain.
+# Can also be set via CLI: --from-block and --to-block (CLI overrides config).
+backtest:
+  from_block: null                   # Starting block (inclusive), null = no auto-start
+  to_block: null                     # Ending block (inclusive), null = no auto-start
+  batch_size: 1000                   # Blocks per batch query
