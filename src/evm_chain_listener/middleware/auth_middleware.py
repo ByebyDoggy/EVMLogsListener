@@ -12,10 +12,12 @@ Usage:
         return {"user": current_user}
 """
 
-from typing import Optional
+from typing import Optional, List
 from datetime import datetime
-from fastapi import Depends, HTTPException, status
+from fastapi import Depends, HTTPException, status, Request
+from fastapi.responses import JSONResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from starlette.middleware.base import BaseHTTPMiddleware
 import jwt
 import os
 
@@ -82,11 +84,78 @@ class JWTVerifier:
 jwt_verifier = JWTVerifier()
 
 
-async def get_current_user(
-    credentials: HTTPAuthorizationCredentials = Depends(security)
-) -> dict:
+class JWTAuthMiddleware(BaseHTTPMiddleware):
     """
-    FastAPI dependency to get current authenticated user from JWT token
+    FastAPI middleware for JWT authentication
+
+    This middleware automatically verifies JWT tokens for all requests except public paths.
+    """
+
+    def __init__(self, app, secret_key: str, algorithm: str = "HS256", public_paths: List[str] = None):
+        super().__init__(app)
+        self.secret_key = secret_key
+        self.algorithm = algorithm
+        self.public_paths = public_paths or []
+        self.verifier = JWTVerifier(secret_key, algorithm)
+
+    async def dispatch(self, request: Request, call_next):
+        # For public paths, try to authenticate if token is present, but don't require it
+        is_public = request.url.path in self.public_paths
+
+        # Check for Authorization header
+        auth_header = request.headers.get("Authorization")
+
+        if not auth_header:
+            if is_public:
+                # Public path without token - allow through
+                return await call_next(request)
+            else:
+                # Protected path without token - reject
+                return JSONResponse(
+                    status_code=401,
+                    content={"detail": "Missing authorization header"}
+                )
+
+        # Extract token
+        try:
+            scheme, token = auth_header.split()
+            if scheme.lower() != "bearer":
+                if is_public:
+                    # Public path with invalid scheme - allow through without auth
+                    return await call_next(request)
+                return JSONResponse(
+                    status_code=401,
+                    content={"detail": "Invalid authentication scheme"}
+                )
+        except ValueError:
+            if is_public:
+                # Public path with malformed header - allow through without auth
+                return await call_next(request)
+            return JSONResponse(
+                status_code=401,
+                content={"detail": "Invalid authorization header format"}
+            )
+
+        # Verify token
+        try:
+            payload = self.verifier.verify_token(token)
+            request.state.user = payload
+        except HTTPException as e:
+            if is_public:
+                # Public path with invalid token - allow through without auth
+                return await call_next(request)
+            return JSONResponse(
+                status_code=e.status_code,
+                content={"detail": e.detail}
+            )
+
+        return await call_next(request)
+
+
+async def get_current_user(request: Request) -> dict:
+    """
+    FastAPI dependency to get current authenticated user from request state
+    (set by JWTAuthMiddleware)
 
     Usage:
         @app.get("/api/protected")
@@ -105,15 +174,18 @@ async def get_current_user(
                 "iat": int
             }
     """
-    token = credentials.credentials
-    return jwt_verifier.verify_token(token)
+    if not hasattr(request.state, "user"):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Not authenticated",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return request.state.user
 
 
-async def get_current_user_optional(
-    credentials: Optional[HTTPAuthorizationCredentials] = Depends(HTTPBearer(auto_error=False))
-) -> Optional[dict]:
+async def get_current_user_optional(request: Request) -> Optional[dict]:
     """
-    FastAPI dependency to get current user, but don't raise error if not authenticated
+    FastAPI dependency to get current user from request state, but don't raise error if not authenticated
 
     Usage:
         @app.get("/api/optional-auth")
@@ -125,14 +197,7 @@ async def get_current_user_optional(
     Returns:
         Optional[dict]: User information if authenticated, None otherwise
     """
-    if not credentials:
-        return None
-
-    try:
-        token = credentials.credentials
-        return jwt_verifier.verify_token(token)
-    except HTTPException:
-        return None
+    return getattr(request.state, "user", None)
 
 
 async def require_admin(current_user: dict = Depends(get_current_user)) -> dict:
