@@ -1,6 +1,12 @@
 aiohttp>=3.9.0
+apipool-ng>=1.0.7
+httpx>=0.27.0
 pyyaml>=6.0
 fastapi>=0.109.0
 uvicorn>=0.27.0
 jinja2>=3.1.0
 websockets>=12.0
+
+# 认证
+PyJWT>=2.8.0
+python-jose[cryptography]>=3.3.0

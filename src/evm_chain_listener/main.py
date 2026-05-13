@@ -19,6 +19,9 @@ from .cache.log_cache import LogCache
 from .chains.base import ChainListener
 from .chains.backtest import BacktestRunner
 from .config import load_config
+from .db_recorder import LogDbRecorder
+from .db_replay import LogDbReplaySource
+from .middleware.auth_middleware import JWTAuthMiddleware, get_current_user
 from .models import (
     AppConfig,
     BacktestConfig as BacktestConfigModel,
@@ -26,8 +29,6 @@ from .models import (
     Log,
 )
 from .pusher import LogPusher
-from .recorder import LogRecorder
-from .replay import LogReplaySource
 from .utils.logging import get_logger, setup_logging
 
 logger = get_logger(__name__)
@@ -37,7 +38,7 @@ _cache: Optional[LogCache] = None
 _listeners: List[ChainListener] = []
 _backtest_runners: Dict[str, BacktestRunner] = {}  # chain_name_or_id -> BacktestRunner
 _pusher: Optional[LogPusher] = None
-_recorders: Dict[str, LogRecorder] = {}  # chain_name -> LogRecorder
+_recorders: Dict[str, LogDbRecorder] = {}  # chain_name -> LogDbRecorder
 _config: Optional[AppConfig] = None
 _mode: str = "realtime"  # "realtime" or "backtest"
 _cli_from_block: Optional[int] = None  # CLI override for backtest from_block
@@ -142,15 +143,17 @@ async def lifespan(app: FastAPI):
     # Init recorders if recording is enabled
     if _config.recorder.enabled:
         for chain_config in _config.chains:
-            rec = LogRecorder(
-                directory=_config.recorder.directory,
+            from pathlib import Path as _P
+            db_path = str(_P(_config.recorder.directory) / (_config.recorder.db_filename or "logs.db"))
+            rec = LogDbRecorder(
+                db_path=db_path,
                 chain_name=chain_config.name,
                 chain_id=chain_config.chain_id,
             )
             _recorders[chain_config.name] = rec
             logger.info(
                 f"[recorder] Recording enabled for {chain_config.name} "
-                f"→ {_config.recorder.directory}",
+                f"→ {db_path}",
                 extra={"chain": chain_config.name},
             )
 
@@ -297,24 +300,26 @@ async def _check_and_replay_gaps() -> None:
 
 
 async def _start_replay() -> None:
-    """Start replaying logs from local files based on replay config."""
+    """Start replaying logs from local SQLite databases based on replay config."""
     global _config, _backtest_runners
 
     replay_cfg = _config.replay
     chain_configs = {c.name: c for c in _config.chains}
 
     if replay_cfg.file_path:
-        # Single file mode: replay one file for the first configured chain
+        # Single file mode: replay one database for the first configured chain
         chain = _config.chains[0] if _config.chains else None
         if not chain:
             logger.error("[replay] No chains configured, cannot replay")
             return
 
-        source = LogReplaySource(
-            file_path=replay_cfg.file_path,
+        source = LogDbReplaySource(
+            db_path=replay_cfg.file_path,
             chain_name=chain.name,
             chain_id=chain.chain_id,
             log_callback=_on_logs_received,
+            blocks_per_batch=replay_cfg.blocks_per_batch,
+            batch_interval_seconds=replay_cfg.batch_interval_seconds,
         )
 
         async def _do_replay():
@@ -332,35 +337,31 @@ async def _start_replay() -> None:
         asyncio.create_task(_do_replay())
 
     elif replay_cfg.directory:
-        # Directory mode: discover and replay all matching recordings
+        # Directory mode: discover and replay all matching databases
         async def _do_directory_replay():
-            for chain_config in _config.chains:
-                recordings = LogReplaySource.discover_recordings(
-                    replay_cfg.directory,
-                    chain_name=chain_config.name,
-                )
-                for rec_info in recordings:
-                    filename = rec_info.get("file")
-                    if not filename:
-                        continue
-                    file_path = str(Path(replay_cfg.directory) / filename)
+            dir_path = Path(replay_cfg.directory)
+
+            for db_file in sorted(dir_path.glob("*.db")):
+                for chain_config in _config.chains:
                     try:
-                        source = LogReplaySource(
-                            file_path=file_path,
+                        source = LogDbReplaySource(
+                            db_path=str(db_file),
                             chain_name=chain_config.name,
                             chain_id=chain_config.chain_id,
                             log_callback=_on_logs_received,
+                            blocks_per_batch=replay_cfg.blocks_per_batch,
+                            batch_interval_seconds=replay_cfg.batch_interval_seconds,
                         )
                         total = await source.replay(
                             from_block=replay_cfg.from_block,
                             to_block=replay_cfg.to_block,
                         )
                         logger.info(
-                            f"[replay] Replayed {total} logs from {filename} "
+                            f"[replay] Replayed {total} logs from {db_file.name} "
                             f"for chain {chain_config.name}",
                         )
                     except Exception as e:
-                        logger.error(f"[replay] Failed to replay {filename}: {e}")
+                        logger.error(f"[replay] Failed to replay {db_file.name}: {e}")
 
         asyncio.create_task(_do_directory_replay())
 
@@ -371,6 +372,18 @@ app = FastAPI(
     description="Lightweight EVM-compatible chain log listener (Realtime & Backtest mode)",
     version="1.0.0",
     lifespan=lifespan,
+)
+
+# Add JWT authentication middleware
+import os
+JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY", "your-super-secret-jwt-key-change-in-production")
+JWT_ALGORITHM = os.getenv("JWT_ALGORITHM", "HS256")
+
+app.add_middleware(
+    JWTAuthMiddleware,
+    secret_key=JWT_SECRET_KEY,
+    algorithm=JWT_ALGORITHM,
+    public_paths=["/", "/health", "/ready", "/docs", "/openapi.json", "/redoc"]
 )
 
 # Setup templates
@@ -566,23 +579,38 @@ async def list_backtest_chains():
 async def list_recordings(
     directory: Optional[str] = Query(None, description="Directory to scan for recordings"),
 ):
-    """List available recording files for replay."""
+    """List available recording databases for replay."""
     global _config
     scan_dir = directory or _config.replay.directory or _config.recorder.directory
     if not scan_dir:
         return {"status": "success", "data": {"recordings": [], "message": "No recording directory configured"}}
-    recordings = LogReplaySource.discover_recordings(scan_dir)
+
+    recordings = []
+
+    # Discover SQLite databases
+    dir_path = Path(scan_dir)
+    if dir_path.exists():
+        for db_file in sorted(dir_path.glob("*.db")):
+            sessions = LogDbReplaySource.discover_sessions(str(db_file))
+            for session in sessions:
+                session["file"] = db_file.name
+                session["type"] = "sqlite"
+                session["path"] = str(db_file)
+                recordings.append(session)
+
     return {"status": "success", "data": {"recordings": recordings, "directory": scan_dir}}
 
 
 @app.post("/api/replay/start")
 async def start_replay(
-    file_path: Optional[str] = Query(None, description="JSONL file to replay"),
+    file_path: Optional[str] = Query(None, description="SQLite database file to replay"),
     chain: Optional[str] = Query(None, description="Chain name or ID"),
     from_block: Optional[int] = Query(None, description="Start block filter"),
     to_block: Optional[int] = Query(None, description="End block filter"),
+    blocks_per_batch: int = Query(2, ge=1, description="Number of blocks per replay batch"),
+    batch_interval_seconds: float = Query(5.0, ge=0, description="Seconds to wait between batches"),
 ):
-    """Start replaying logs from a local recording file."""
+    """Start replaying logs from a local SQLite database."""
     global _config, _backtest_runners
 
     if not file_path:
@@ -600,11 +628,13 @@ async def start_replay(
     if not chain_config:
         raise HTTPException(status_code=400, detail="No chain configuration available")
 
-    source = LogReplaySource(
-        file_path=file_path,
+    source = LogDbReplaySource(
+        db_path=file_path,
         chain_name=chain_config.name,
         chain_id=chain_config.chain_id,
         log_callback=_on_logs_received,
+        blocks_per_batch=blocks_per_batch,
+        batch_interval_seconds=batch_interval_seconds,
     )
 
     async def _do_replay():
@@ -623,6 +653,8 @@ async def start_replay(
             "chain": chain_config.name,
             "from_block": from_block,
             "to_block": to_block,
+            "blocks_per_batch": blocks_per_batch,
+            "batch_interval_seconds": batch_interval_seconds,
         },
     }
 
