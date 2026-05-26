@@ -112,9 +112,9 @@ def parse_chain_config(chain_data: Dict[str, Any]) -> ChainConfig:
             raise ConfigError(f"Invalid RPC node configuration: {e}")
     
     if not rpc_nodes:
-        # apipool_urls can serve as alternative source of RPC endpoints
-        if not chain_data.get('apipool_urls'):
-            raise ConfigError(f"At least one RPC node or apipool_urls is required for chain '{name}'")
+        # apipool_server can serve as alternative source of RPC endpoints
+        if not chain_data.get('apipool_server'):
+            raise ConfigError(f"At least one RPC node or apipool_server is required for chain '{name}'")
     
     return ChainConfig(
         name=name,
@@ -123,7 +123,7 @@ def parse_chain_config(chain_data: Dict[str, Any]) -> ChainConfig:
         rpc_nodes=rpc_nodes,
         address_filter=chain_data.get('address_filter'),
         topics_filter=chain_data.get('topics_filter'),
-        apipool_urls=chain_data.get('apipool_urls'),
+        apipool_server=chain_data.get('apipool_server'),
     )
 
 
@@ -201,6 +201,7 @@ def parse_recorder_config(rec_data: Optional[Dict[str, Any]]) -> RecorderConfig:
     return RecorderConfig(
         enabled=rec_data.get('enabled', False),
         directory=rec_data.get('directory', './recordings'),
+        db_filename=rec_data.get('db_filename'),
     )
 
 
@@ -213,6 +214,8 @@ def parse_replay_config(replay_data: Optional[Dict[str, Any]]) -> ReplayConfig:
         directory=replay_data.get('directory'),
         from_block=replay_data.get('from_block'),
         to_block=replay_data.get('to_block'),
+        blocks_per_batch=int(replay_data.get('blocks_per_batch', 2)),
+        batch_interval_seconds=float(replay_data.get('batch_interval_seconds', 5.0)),
     )
 
 

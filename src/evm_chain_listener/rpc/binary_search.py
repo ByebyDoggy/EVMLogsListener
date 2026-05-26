@@ -1,24 +1,29 @@
 """Binary search query for handling log limit exceeded errors."""
 
 import asyncio
-from typing import List, Optional
+from typing import List, Optional, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .apipool_client import EvmRpcPool
 
 from ..models import Log
 from ..utils.logging import get_logger
 from .exceptions import AllNodesFailedError, LogLimitExceededError
-from .node_pool import RPCNodePool
 
 logger = get_logger(__name__)
 
 
 class BinarySearchQuerier:
-    """Handles log queries with binary search to handle limit exceeded errors."""
+    """Handles log queries with binary search to handle limit exceeded errors.
+    
+    Works with any RPC pool that exposes ``get_logs()`` returning raw dicts.
+    """
     
     MAX_LOGS_PER_QUERY = 10000
     
     def __init__(
         self,
-        rpc_pool: RPCNodePool,
+        rpc_pool: "EvmRpcPool",
         max_results_per_query: int = MAX_LOGS_PER_QUERY,
     ):
         """Initialize the binary search querier.
@@ -126,13 +131,19 @@ class BinarySearchQuerier:
             List of Log objects
         """
         try:
-            logs = await self._rpc_pool.get_logs(
+            raw_logs = await self._rpc_pool.get_logs(
                 from_block=from_block,
                 to_block=to_block,
                 address=address,
                 topics=topics,
             )
-            
+
+            # Convert raw RPC dicts -> Log objects
+            logs = [
+                Log.from_rpc_response(item, self._rpc_pool.chain_id, self._rpc_pool.chain_name)
+                for item in raw_logs
+            ]
+
             if len(logs) >= self._max_results_per_query:
                 logger.warning(
                     f"Query returned {len(logs)} logs, approaching limit",
@@ -142,7 +153,7 @@ class BinarySearchQuerier:
                         "to_block": to_block,
                     },
                 )
-            
+
             return logs
         
         except LogLimitExceededError:

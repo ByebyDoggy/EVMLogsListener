@@ -14,7 +14,7 @@ from ..models import (
 )
 from ..rpc.binary_search import BinarySearchQuerier
 from ..rpc.exceptions import AllNodesFailedError
-from ..rpc.node_pool import RPCNodePool
+from ..rpc.apipool_client import EvmRpcPool
 from ..utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -23,8 +23,9 @@ logger = get_logger(__name__)
 class BacktestRunner:
     """Executes backtest queries on historical block ranges.
 
-    Uses the same RPC pool and BinarySearchQuerier as realtime mode,
-    but queries a fixed [from_block, to_block] range in batches.
+    Uses :class:`~evm_chain_listener.rpc.apipool_client.EvmRpcPool` which
+    delegates all rotation / retry / ban logic to apipool-server (or the
+    local apipool-ng library).
 
     When ``use_rpc=False``, no RPC pool is created (used for file-based
     replay mode where logs come from local recordings instead of RPC).
@@ -40,31 +41,55 @@ class BacktestRunner:
         self.log_callback = log_callback
         self._use_rpc = use_rpc
 
-        if use_rpc:
-            self._rpc_pool = RPCNodePool(
-                nodes=chain_config.rpc_nodes,
-                chain_id=chain_config.chain_id,
-                chain_name=chain_config.name,
-            )
-            self._querier = BinarySearchQuerier(self._rpc_pool)
-        else:
-            self._rpc_pool = None
-            self._querier = None
+        self._rpc_pool: Optional[EvmRpcPool] = None
+        self._querier: Optional[BinarySearchQuerier] = None
 
         # Active task tracking
         self._tasks: Dict[str, BacktestTaskStatus] = {}
 
     @property
-    def rpc_pool(self) -> Optional[RPCNodePool]:
+    def rpc_pool(self) -> Optional[EvmRpcPool]:
         return self._rpc_pool
+
+    async def _init_rpc_pool(self) -> EvmRpcPool:
+        """Build or connect the RPC pool from config (same as ChainListener)."""
+        if self.chain_config.apipool_server:
+            srv = self.chain_config.apipool_server
+            pool = await EvmRpcPool.from_server(
+                service_url=srv["service_url"],
+                pool_identifier=srv.get("pool_identifier", srv.get("client_type", "")),
+                username=srv["username"],
+                password=srv["password"],
+                chain_id=self.chain_config.chain_id,
+                chain_name=self.chain_config.name,
+            )
+        else:
+            urls = [n.url for n in self.chain_config.rpc_nodes]
+            if not urls:
+                raise RuntimeError(
+                    f"Backtest for '{self.chain_config.name}': no rpc_nodes "
+                    f"and no apipool_server configured"
+                )
+            pool = EvmRpcPool(
+                urls=urls,
+                chain_id=self.chain_config.chain_id,
+                chain_name=self.chain_config.name,
+            )
+        await pool.start()
+        return pool
+
+    async def ensure_pool(self):
+        """Lazily initialize RPC pool on first use."""
+        if self._use_rpc and self._rpc_pool is None:
+            self._rpc_pool = await self._init_rpc_pool()
+            self._querier = BinarySearchQuerier(self._rpc_pool)
 
     async def close(self) -> None:
         if self._rpc_pool:
-            await self._rpc_pool.close()
+            await self._rpc_pool.stop()
 
     async def health_check(self) -> bool:
-        if not self._rpc_pool:
-            # File replay mode: always "healthy" since no RPC needed
+        if not self._use_rpc or not self._rpc_pool:
             return True
         try:
             await self._rpc_pool.get_block_number()
@@ -98,6 +123,9 @@ class BacktestRunner:
                 "(use_rpc=False). Use the replay config instead."
             )
 
+        # Ensure RPC pool is initialized (lazy)
+        await self.ensure_pool()
+        
         task_id = uuid.uuid4().hex[:12]
 
         # Validate range

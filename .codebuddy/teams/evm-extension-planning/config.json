@@ -1,0 +1,48 @@
+{
+  "name": "evm-extension-planning",
+  "leadAgentId": "72a933a3a38346bf8ccd365b81d57460",
+  "workspacePath": "d:/Programming/Python/EVMLogListener",
+  "createdAt": "2026-04-17T13:22:39.346Z",
+  "options": {
+    "workspacePath": "d:/Programming/Python/EVMLogListener",
+    "isAutoTeam": false
+  },
+  "members": [
+    {
+      "memberId": "team-lead@evm-extension-planning",
+      "name": "team-lead",
+      "role": "Team Lead - coordinates the team and interacts with the user"
+    },
+    {
+      "memberId": "architect@evm-extension-planning",
+      "name": "architect",
+      "role": "架构师分析扩展性"
+    },
+    {
+      "memberId": "security-engineer@evm-extension-planning",
+      "name": "security-engineer",
+      "role": "安全工程师分析"
+    },
+    {
+      "memberId": "devops-engineer@evm-extension-planning",
+      "name": "devops-engineer",
+      "role": "DevOps运维分析"
+    },
+    {
+      "memberId": "product-manager@evm-extension-planning",
+      "name": "product-manager",
+      "role": "产品经理功能分析"
+    },
+    {
+      "memberId": "performance-engineer@evm-extension-planning",
+      "name": "performance-engineer",
+      "role": "性能工程师分析"
+    },
+    {
+      "memberId": "qa-engineer@evm-extension-planning",
+      "name": "qa-engineer",
+      "role": "测试工程师质量分析"
+    }
+  ],
+  "isAutoTeam": false
+}

@@ -36,6 +36,14 @@ chains:
   - name: polygon
     chain_id: 137
     poll_interval: 30
+    # --- Option: apipool-server auto-load (v1.0.5+) ---
+    # Instead of hardcoding URLs, login to apipool-server and
+    # auto-fetch the key list at startup.
+    # apipool_server:
+    #   service_url: "http://localhost:8000"
+    #   client_type: "polygon-rpc"
+    #   username: "alice"
+    #   password: "${APIPOOL_PASSWORD}"
     rpc_nodes:
       - url: "${POLYGON_RPC_URL}"
         priority: 1
@@ -72,9 +80,25 @@ alert_processor:
   reconnect_check_on_startup: true
   replay_endpoint: "/ingest/logs/replay"
 
+# --- Log Recorder: save logs to local SQLite storage ---
+# Enable in realtime or backtest mode to record all incoming logs.
+# Recorded data can later be replayed via the `replay` config.
 recorder:
-  enabled: false
-  directory: "./recordings"
+  enabled: false                      # Set true to enable recording
+  directory: "./recordings"           # Directory for the SQLite database
+  # db_filename: "logs.db"            # SQLite filename (default: logs.db)
+
+# --- Log Replay: load logs from local SQLite storage instead of RPC ---
+# Only used in backtest mode. When configured, backtest will read logs
+# from a local database instead of querying RPC nodes.
+# replay:
+#   file_path: "./recordings/logs.db"   # SQLite database path
+#   # OR directory mode (auto-discovers .db files):
+#   # directory: "./recordings"
+#   from_block: null                    # Optional block range filter
+#   to_block: null
+#   blocks_per_batch: 2                 # Number of blocks per replay batch (default: 2)
+#   batch_interval_seconds: 5.0         # Seconds to wait between batches (default: 5.0)
 
 # --- Backtest Startup Config ---
 # Only used in backtest mode. When from_block/to_block are set, a backtest

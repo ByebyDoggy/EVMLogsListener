@@ -1,35 +1,75 @@
-"""EVM RPC Client backed by apipool-ng ApiKeyManager.
+"""EVM RPC Client backed by apipool-ng **AsyncDynamicKeyManager** (v1.0.7+).
 
 Provides:
-  - ``EthRpcApiKey``: maps one RPC endpoint URL → one ApiKey
-  - ``EvmRpcPool``: high-level pool manager wrapping ApiKeyManager,
-    with the same interface as the original ``RPCNodePool``
-  - ``JsonRpcClient``: lightweight JSON-RPC client supporting
-    attribute-chain navigation for use with ChainProxy.
+  - ``EthRpcApiKey``: maps one RPC endpoint URL -> one :class:`~apipool.ApiKey`
+  - ``EvmRpcPool``: high-level pool manager wrapping
+    :class:`~apipool.AsyncDynamicKeyManager`, with the same public API as the
+    original ``RPCNodePool``.
+  - ``JsonRpcClient``: lightweight JSON-RPC client supporting attribute-chain
+    navigation for use with ChainProxy.
 
-Usage::
+Architecture (server-driven control)::
 
-    from evm_chain_listener.rpc.apipool_client import EvmRpcPool, EthRpcApiKey
+    +-------------------+       async refresh        +---------------+
+    |   apipool-server  | <---------------------- | DynamicKeyMgr |
+    |  - key list mgmt  |                            |  (this lib)  |
+    |  - rotation strat |  - alogin / aget_keys      |              |
+    |  - concurrency    |  - get_config / apply_cfg  |  adummyclient |
+    |  - rate limiting  |                            |    .eth_xxx() |
+    |  - key banning    |                            +------+-------+
+    +-------------------+                                   |
+                                                          v
+                                                  +----------------+
+                                                  | JsonRpcClient  |
+                                                  | (HTTP transport)|
+                                                  +----------------+
+
+All node selection, retry, throttling, health-tracking, and failover is
+delegated to ``AsyncDynamicKeyManager`` which syncs its behaviour from the
+apipool-server at configurable intervals.  The client holds *zero* internal
+polling / rotation / back-off state.
+
+Usage (apipool-server auto-load — recommended)::
+
+    pool = await EvmRpcPool.from_server(
+        service_url="http://apipool-server:8000",
+        pool_identifier="my-eth-pool",
+        username="alice",
+        password="secret",
+        chain_id=1,
+        chain_name="ethereum",
+    )
+    block_num = await pool.get_block_number()
+
+Usage (local URLs — backward-compatible fallback)::
 
     urls = ["https://node1.example.com", "https://node2.example.com"]
     pool = EvmRpcPool(urls=urls, chain_id=1, chain_name="ethereum")
-
-    # Transparently load-balanced across all URLs
     block_num = await pool.get_block_number()
-    logs = await pool.get_logs(from_block=0, to_block=100)
 """
 
 import json
-import random
-from typing import Any, Dict, List, Optional
+import logging
+import httpx
+from typing import Any, Dict, List, Optional, Union
 
 import aiohttp
 
-from apipool import ApiKey, ApiKeyManager, PoolExhaustedError
+from apipool import (
+    ApiKey,
+    AsyncDynamicKeyManager,
+    PoolConfig,
+    PoolExhaustedError,
+    aget_config,
+    aget_keys,
+    alogin,
+)
+
+logger = logging.getLogger(__name__)
 
 
 # ============================================================
-# Custom exceptions (mirrors original node_pool exceptions)
+# Exceptions
 # ============================================================
 
 class RpcRateLimitError(Exception):
@@ -66,7 +106,6 @@ class InvalidResponseError(Exception):
     def __init__(self, message, *args, **kwargs):
         self.node_url = kwargs.pop("node_url", "")
         super().__init__(message, *args)
-    pass
 
 
 def parse_rpc_error(error: dict, node_url: str = "") -> Exception:
@@ -79,16 +118,18 @@ def parse_rpc_error(error: dict, node_url: str = "") -> Exception:
     elif code == -32603 or code == -32700:
         return InvalidResponseError(msg, node_url=node_url)
     else:
-        # Return generic Exception (matches original behaviour)
         return Exception(f"RPC Error ({code}): {msg}")
 
 
 # ============================================================
-# JsonRpcClient — lightweight client with attr-chain support
+# JsonRpcClient -- lightweight client with attr-chain support
 # ============================================================
 
+import random
+
+
 class _JsonRpcMethod:
-    """Represents a callable RPC method like ``client.eth.get_block``.
+    """Represents a callable RPC method like ``client.eth_get_block``.
 
     When called, it sends the actual JSON-RPC request.
     """
@@ -97,11 +138,11 @@ class _JsonRpcMethod:
                  method_path: str, timeout: int = 30):
         self._session = session
         self._url = url
-        self._method_path = method_path  # e.g. "eth_getBlock"
+        self._method_path = method_path
         self._timeout = aiohttp.ClientTimeout(total=timeout)
 
     async def __call__(self, *args, **kwargs) -> Any:
-        payload = {
+        payload: Dict[str, Any] = {
             "jsonrpc": "2.0",
             "method": self._method_path,
             "params": list(args) if args else kwargs.get("params", []),
@@ -135,14 +176,13 @@ class _JsonRpcMethod:
 class JsonRpcClient:
     """Lightweight async JSON-RPC HTTP client.
 
-    Supports attribute-chain navigation so it works seamlessly
-    with apipool-ng's :class:`~apipool.manager.ChainProxy`.
+    Supports attribute-chain navigation so it works seamlessly with
+    apipool-ng's :class:`~apipool.manager.ChainProxy`.
 
     Example::
 
         client = JsonRpcClient(session, "https://rpc.example.com")
-        # These work via __getattr__ returning intermediate proxies:
-        await client.eth_block_number()
+        await client.eth_blockNumber()
         await client.eth_getBlockByNumber("0x123", False)
         await client.eth_getLogs({"fromBlock": "0x1", "toBlock": "0x10"})
     """
@@ -163,18 +203,7 @@ class JsonRpcClient:
         return self._url
 
     def __getattr__(self, item: str) -> Any:
-        """Return a callable RPC method proxy.
-
-        This enables both styles:
-
-        - ``await client.eth_block_number()``   — flat method name
-        - ``await client.eth.get_block('latest')`` — dotted chain
-          (handled by ChainProxy wrapping us).
-        """
-        # Convert camelCase / snake_case RPC names to the exact string.
-        # ChainProxy will handle multi-level chains like .eth.get_block
-        # by calling __getattr__ multiple times; here we just return
-        # a leaf callable.
+        """Return a callable RPC method proxy."""
         return _JsonRpcMethod(
             session=self._session,
             url=self._url,
@@ -184,7 +213,7 @@ class JsonRpcClient:
 
 
 # ============================================================
-# EthRpcApiKey — one URL = one ApiKey
+# EthRpcApiKey -- one URL = one ApiKey
 # ============================================================
 
 class EthRpcApiKey(ApiKey):
@@ -213,21 +242,9 @@ class EthRpcApiKey(ApiKey):
             self._session = aiohttp.ClientSession()
         return JsonRpcClient(self._session, self.url)
 
-    def test_usability(self, client: Any) -> bool:
+    def test_usability(self, client: Any):
         """Quick health check: call eth_blockNumber."""
-        try:
-            result = client.eth_block_number()
-            # client methods are async-compatible but test_usability may be sync
-            import asyncio
-            if asyncio.iscoroutine(result):
-                loop = asyncio.new_event_loop()
-                try:
-                    result = loop.run_until_complete(result)
-                finally:
-                    loop.close()
-            return result is not None
-        except Exception:
-            return False
+        return client.eth_blockNumber()
 
     async def close(self) -> None:
         if self._session and not self._session.closed:
@@ -235,35 +252,43 @@ class EthRpcApiKey(ApiKey):
 
 
 # ============================================================
-# EvmRpcPool — high-level pool manager
+# EvmRpcPool -- high-level pool manager (server-driven)
 # ============================================================
 
 class EvmRpcPool:
-    """EVM RPC connection pool powered by **apipool-ng**.
+    """EVM RPC connection pool powered by **apipool-ng** AsyncDynamicKeyManager.
 
-    Features inherited from apipool-ng:
-      - Random load balancing across all endpoints
-      - Automatic key eviction on ``reach_limit_exc`` (e.g. 429)
-      - Built-in usage statistics (SQLite in-memory)
-      - Health check via ``check_usable()``
+    Delegates ALL operational concerns to the apipool-server:
 
-    Additional features over raw ApiKeyManager:
-      - Async-native API matching original ``RPCNodePool`` interface
-      - Per-node rate limiting awareness
-      - Graceful degradation when pool is exhausted
+    - **Node selection** -- server's rotation strategy (random / round-robin /
+      least-used).
+    - **Key eviction** -- server's ``reach_limit_exception`` rules (default:
+      any ``Exception`` triggers swap since v1.0.7).
+    - **Concurrency / rate-limit** -- synced from server ``pool_config``.
+    - **Health & banning** -- server tracks consecutive failures and bans.
+    - **Auto-refresh** -- ``AsyncDynamicKeyManager`` periodically re-fetches the
+      key list so added / removed endpoints are picked up without restart.
 
-    Example::
+    Two construction modes:
 
-        pool = EvmRpcPool(
-            urls=["https://node1.com", "https://node2.com"],
-            chain_id=1,
-            chain_name="ethereum",
-        )
+    1. **apipool-server** (recommended) -- ``from_server()`` uses
+       ``AsyncDynamicKeyManager`` for fully automatic lifecycle management::
 
-        block = await pool.get_block_number()
-        logs  = await pool.get_logs(0, 100)
-        await pool.close()
+           pool = await EvmRpcPool.from_server(
+               service_url="http://apipool-server:8000",
+               pool_identifier="my-eth-pool",
+               username="alice", password="secret",
+               chain_id=1, chain_name="ethereum",
+           )
+
+    2. **Local URLs** (backward-compat) -- falls back to a static key list
+       with a plain ``ApiKeyManager`` (no server sync)::
+
+           pool = EvmRpcPool(urls=["https://n1.com", ...], ...)
     """
+
+    # Default refresh interval (seconds) for key-list sync from server.
+    DEFAULT_REFRESH_INTERVAL: float = 60.0
 
     def __init__(
         self,
@@ -271,30 +296,171 @@ class EvmRpcPool:
         chain_id: int = 0,
         chain_name: str = "",
         *,
-        reach_limit_exc: type = RpcRateLimitError,
         timeout_seconds: int = 30,
     ):
+        """Create pool from a static list of URLs.
+
+        .. note::
+           This constructor creates a **static** pool that does NOT sync with
+           an apipool-server.  Use :meth:`from_server` for server-driven mode.
+
+        Args:
+            urls: List of RPC endpoint URLs.
+            chain_id: EVM chain ID.
+            chain_name: Human-readable name.
+            timeout_seconds: Per-request HTTP timeout.
+        """
         self.chain_id = chain_id
         self.chain_name = chain_name
         self._timeout = timeout_seconds
+        self._server_mode = False
 
-        # Build ApiKey list
+        # Build static ApiKey list
         apikey_list = [EthRpcApiKey(url) for url in urls]
-        self._manager = ApiKeyManager(
+        from apipool import ApiKeyManager
+        self._manager: Union[ApiKeyManager, AsyncDynamicKeyManager] = ApiKeyManager(
             apikey_list=apikey_list,
-            reach_limit_exc=reach_limit_exc,
         )
 
     # ------------------------------------------------------------------
-    # Public API — mirrors RPCNodePool interface
+    # Primary factory: apipool-server driven mode
     # ------------------------------------------------------------------
 
+    @classmethod
+    async def from_server(
+        cls,
+        service_url: str,
+        pool_identifier: str,
+        username: str,
+        password: str,
+        chain_id: int = 0,
+        chain_name: str = "",
+        *,
+        timeout_seconds: int = 30,
+        refresh_interval: float = DEFAULT_REFRESH_INTERVAL,
+    ) -> "EvmRpcPool":
+        """Create an EvmRpcPool backed by an apipool-server instance.
+
+        Uses ``AsyncDynamicKeyManager`` which automatically:
+
+        1. Authenticates via ``alogin``.
+        2. Fetches raw key (URL) list via ``aget_keys``.
+        3. Periodically refreshes the key list (add/remove detected).
+        4. Syncs ``pool_config`` (concurrency, timeouts, retries, ban
+           settings) from the server.
+
+        Args:
+            service_url: Base URL of the apipool-server.
+            pool_identifier: Pool identifier on the server.
+            username: Login username.
+            password: Login password.
+            chain_id: EVM chain ID.
+            chain_name: Human-readable chain name.
+            timeout_seconds: Per-request HTTP timeout.
+            refresh_interval: Seconds between key-list refreshes.
+
+        Returns:
+            A fully initialized, started ``EvmRpcPool``.
+        """
+        # 1. Authenticate
+        tokens = await alogin(service_url, username, password)
+        auth_token = tokens["access_token"]
+
+        # 2. Build key-fetcher closure (captures auth details)
+        async def _key_fetcher():
+            try:
+                raw_keys = await aget_keys(service_url, pool_identifier, auth_token)
+                logger.info(
+                    "[DEBUG] _key_fetcher success: url=%s, pool=%s, keys_count=%d",
+                    service_url, pool_identifier, len(raw_keys),
+                )
+                return raw_keys
+            except Exception as exc:
+                logger.error(
+                    "[DEBUG] _key_fetcher FAILED: url=%s, pool=%s, error=%s: %s",
+                    service_url, pool_identifier, type(exc).__name__, str(exc),
+                    exc_info=True,
+                )
+                raise
+
+        # 3. Build config-fetcher closure (tolerant of missing endpoint / 404)
+        async def _config_fetcher():
+            try:
+                return await aget_config(service_url, pool_identifier, auth_token)
+            except httpx.HTTPStatusError as exc:
+                if exc.response.status_code == 404:
+                    logger.warning(
+                        "Config endpoint returned 404 for pool '%s' — "
+                        "server may not have /{id}/config route or pool does not exist. "
+                        "Using defaults.",
+                        pool_identifier,
+                    )
+                    return PoolConfig()  # return empty/default config
+                raise
+            except Exception:
+                logger.warning(
+                    "Config sync failed for pool '%s', using defaults",
+                    pool_identifier,
+                    exc_info=True,
+                )
+                return PoolConfig()
+
+        # 4. Build API-key factory
+        def _api_key_factory(raw_key: str) -> EthRpcApiKey:
+            return EthRpcApiKey(raw_key)
+
+        # 5. Create the instance with empty initial key list (async init follows)
+        pool = cls.__new__(cls)
+        pool.chain_id = chain_id
+        pool.chain_name = chain_name
+        pool._timeout = timeout_seconds
+        pool._server_mode = True
+        pool._server_info: Dict[str, Any] = {
+            "service_url": service_url,
+            "pool_identifier": pool_identifier,
+            "username": username,
+        }
+
+        # 6. Construct AsyncDynamicKeyManager
+        pool._manager = AsyncDynamicKeyManager(
+            key_fetcher=_key_fetcher,
+            api_key_factory=_api_key_factory,
+            refresh_interval=refresh_interval,
+            config_fetcher=_config_fetcher,
+        )
+
+        # 7. Perform initial async init (fetch keys, connect clients)
+        await pool._manager.ainit()
+
+        logger.info(
+            "EvmRpcPool created from server: %s (pool=%s, chain=%d)",
+            service_url, pool_identifier, chain_id,
+        )
+        return pool
+
+    # ------------------------------------------------------------------
+    # Public API -- mirrors RPCNodePool interface
+    # ------------------------------------------------------------------
+
+    async def start(self) -> None:
+        """Start background refresh (only meaningful in server mode)."""
+        if isinstance(self._manager, AsyncDynamicKeyManager) and self._server_mode:
+            await self._manager.astart()
+            logger.info("EvmRpcPool background refresh started")
+
+    async def stop(self) -> None:
+        """Stop background refresh and close resources."""
+        if isinstance(self._manager, AsyncDynamicKeyManager):
+            try:
+                await self._manager.ashutdown()
+            except Exception:
+                pass
+        await self.close()
+
     async def get_block_number(self) -> int:
-        """Fetch latest block number from a random healthy endpoint."""
+        """Fetch latest block number via adummyclient (auto load-balanced)."""
         try:
-            apikey = self._manager.random_one()
-            client = apikey._client
-            result = await client.eth_block_number()
+            result = await self._manager.adummyclient.eth_blockNumber()
             if result is None:
                 raise InvalidResponseError("eth_blockNumber returned null")
             return int(result, 16)
@@ -314,10 +480,9 @@ class EvmRpcPool:
         address: Optional[str] = None,
         topics: Optional[List[str]] = None,
     ) -> list:
-        """Call eth_getLogs on a random endpoint.
+        """Call eth_getLogs via adummyclient (auto load-balanced).
 
-        Returns the raw log list (list of dicts). Callers can convert
-        to :class:`~evm_chain_listener.models.Log` objects as needed.
+        Returns the raw log list (list of dicts).
         """
         params: Dict[str, Any] = {
             "fromBlock": hex(from_block),
@@ -329,9 +494,7 @@ class EvmRpcPool:
             params["topics"] = topics
 
         try:
-            apikey = self._manager.random_one()
-            client = apikey._client
-            result = await client.eth_getLogs(params)
+            result = await self._manager.adummyclient.eth_getLogs(params)
 
             if result is None:
                 return []
@@ -356,33 +519,30 @@ class EvmRpcPool:
             raise InvalidResponseError(str(e))
 
     async def raw_call(self, method: str, params: list = None) -> Any:
-        """Send a raw JSON-RPC call through the pool."""
+        """Send a raw JSON-RPC call through adummyclient."""
         try:
-            apikey = self._manager.random_one()
-            client = apikey._client
-            method_obj = getattr(client, method)
-            return await method_obj(*(params or []))
+            caller = getattr(self._manager.adummyclient, method)
+            return await caller(*(params or []))
         except PoolExhaustedError:
             raise AllNodesFailedError(
                 f"All RPC nodes exhausted for {self.chain_name}"
             )
 
     async def health_check(self) -> Dict[str, Any]:
-        """Check all endpoints, return health status."""
+        """Check all active endpoints, return health status."""
         healthy_urls = []
         failed_urls = []
         active_url = ""
 
         for pk, apikey in self._manager.apikey_chain.items():
             try:
-                num = await self._call_on_apikey(apikey, "eth_block_number")
+                num = await self._call_on_apikey(apikey, "eth_blockNumber")
                 healthy_urls.append(pk)
                 if not active_url:
                     active_url = pk
             except Exception:
                 failed_urls.append(pk)
 
-        # Also check archived keys
         archived_count = len(self._manager.archived_apikey_chain)
 
         return {
@@ -402,28 +562,33 @@ class EvmRpcPool:
                 await apikey.close()
 
     # ------------------------------------------------------------------
-    # Access to underlying manager (for advanced usage)
+    # Access to underlying manager (for advanced usage / diagnostics)
     # ------------------------------------------------------------------
 
     @property
-    def manager(self) -> ApiKeyManager:
-        """Access the underlying :class:`~apipool.manager.ApiKeyManager`."""
+    def manager(self) -> Union[Any, "AsyncDynamicKeyManager"]:
+        """Access the underlying manager (ApiKeyManager or AsyncDynamicKeyManager)."""
         return self._manager
 
     @property
     def dummy_client(self):
-        """Access the DummyClient for transparent proxy calls.
-
-        Example::
-
-            pool.dummy_client.eth.get_block_by_number('latest', False)
-        """
+        """Access the sync DummyClient for transparent proxy calls."""
         return self._manager.dummyclient
+
+    @property
+    def adummy_client(self):
+        """Access the async DummyClient for transparent async calls."""
+        return self._manager.adummyclient
 
     @property
     def stats(self):
         """Usage statistics collector."""
         return self._manager.stats
+
+    @property
+    def is_server_mode(self) -> bool:
+        """True if this pool is backed by an apipool-server."""
+        return self._server_mode
 
     async def check_usable(self) -> None:
         """Run usability check on all active endpoints."""

@@ -44,7 +44,8 @@ class Log:
 
         Handles both hex-encoded (``to_dict``) and integer numeric fields
         (``to_push_dict``), as well as the ``_chain_id`` / ``_chain_name``
-        metadata fields written by ``LogRecorder``.
+        metadata fields (used by the JSONL→SQLite migration tool for
+        backward compatibility with legacy recording files).
         """
         def _int(val: Any) -> int:
             """Accept int or hex string."""
@@ -143,11 +144,11 @@ class ChainConfig:
     rpc_nodes: List[RPCNodeConfig] = field(default_factory=list)
     address_filter: Optional[List[str]] = None
     topics_filter: Optional[List[str]] = None
-    # apipool-ng based load balancing: list of raw RPC URLs.
-    # When set, these URLs are used by EvmRpcPool (apipool-ng) instead of
-    # the legacy RPCNodePool. Both can coexist; apipool_urls takes priority
-    # when creating the EvmRpcPool instance.
-    apipool_urls: Optional[List[str]] = None
+    # apipool-server auto-load: when set, login to apipool-server and
+    # auto-fetch key list via alogin + aget_keys (v1.0.5+).
+    # This replaces the old apipool_urls field — no need to hardcode
+    # URLs in config; they are loaded from the server at startup.
+    apipool_server: Optional[Dict[str, str]] = None
 
 
 @dataclass
@@ -219,22 +220,29 @@ class PusherStats:
 
 @dataclass
 class RecorderConfig:
-    """Configuration for recording logs to local files."""
+    """Configuration for recording logs to local SQLite database."""
     enabled: bool = False
-    # Directory to store JSONL recording files
+    # Directory to store the SQLite database file
     directory: str = "./recordings"
+    # SQLite database filename. If not set, defaults to "logs.db".
+    db_filename: Optional[str] = None
 
 
 @dataclass
 class ReplayConfig:
-    """Configuration for replaying logs from local files."""
-    # Path to a specific JSONL file to replay
+    """Configuration for replaying logs from local SQLite storage."""
+    # Path to a specific SQLite database to replay
+    #   e.g., "./recordings/logs.db"
     file_path: Optional[str] = None
-    # OR: directory to scan for recordings (discovers .manifest.json files)
+    # OR: directory to scan for recording databases (discovers .db files)
     directory: Optional[str] = None
     # Block range filter (applied to both file and directory mode)
     from_block: Optional[int] = None
     to_block: Optional[int] = None
+    # Number of blocks per batch during replay (default: 2)
+    blocks_per_batch: int = 2
+    # Seconds to wait between batches (default: 5.0)
+    batch_interval_seconds: float = 5.0
 
 
 @dataclass

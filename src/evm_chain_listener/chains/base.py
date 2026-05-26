@@ -8,14 +8,19 @@ from typing import Callable, List, Optional
 from ..models import ChainConfig, ChainStatus, Log
 from ..rpc.binary_search import BinarySearchQuerier
 from ..rpc.exceptions import AllNodesFailedError
-from ..rpc.node_pool import RPCNodePool
+from ..rpc.apipool_client import EvmRpcPool
 from ..utils.logging import get_logger
 
 logger = get_logger(__name__)
 
 
 class ChainListener:
-    """Listens to a specific blockchain for new logs."""
+    """Listens to a specific blockchain for new logs.
+    
+    Uses :class:`~evm_chain_listener.rpc.apipool_client.EvmRpcPool`
+    which delegates all rotation/retry/ban logic to apipool-server (or the
+    local apipool-ng library).  No client-side polling or back-off state.
+    """
     
     def __init__(
         self,
@@ -34,12 +39,9 @@ class ChainListener:
         self.poll_interval = config.poll_interval
         self.log_callback = log_callback
         
-        self._rpc_pool = RPCNodePool(
-            nodes=config.rpc_nodes,
-            chain_id=config.chain_id,
-            chain_name=config.name,
-        )
-        self._querier = BinarySearchQuerier(self._rpc_pool)
+        # RPC pool will be set during async init
+        self._rpc_pool: Optional[EvmRpcPool] = None
+        self._querier: Optional[BinarySearchQuerier] = None
         
         self._last_block: Optional[int] = None
         self._running = False
@@ -65,6 +67,44 @@ class ChainListener:
             error=self._error,
         )
     
+    async def _init_rpc_pool(self) -> EvmRpcPool:
+        """Build or connect the RPC pool from config.
+        
+        If ``apipool_server`` is configured, uses server-driven mode via
+        ``EvmRpcPool.from_server()``.  Otherwise falls back to a static pool
+        from local ``rpc_nodes`` URLs.
+        """
+        if self.config.apipool_server:
+            srv = self.config.apipool_server
+            logger.info(
+                "Initializing RPC pool from server: %s (pool=%s)",
+                srv["service_url"], srv.get("pool_identifier", srv.get("client_type")),
+                extra={"chain": self.name},
+            )
+            pool = await EvmRpcPool.from_server(
+                service_url=srv["service_url"],
+                pool_identifier=srv.get("pool_identifier", srv.get("client_type", "")),
+                username=srv["username"],
+                password=srv["password"],
+                chain_id=self.chain_id,
+                chain_name=self.name,
+            )
+        else:
+            urls = [n.url for n in self.config.rpc_nodes]
+            if not urls:
+                raise RuntimeError(
+                    f"Chain '{self.name}': no rpc_nodes and no apipool_server configured"
+                )
+            pool = EvmRpcPool(
+                urls=urls,
+                chain_id=self.chain_id,
+                chain_name=self.name,
+            )
+        
+        # Start background refresh in server mode
+        await pool.start()
+        return pool
+    
     async def start(self) -> None:
         """Start the chain listener."""
         if self._running:
@@ -79,6 +119,10 @@ class ChainListener:
             f"Starting chain listener: {self.name} (chain_id={self.chain_id})",
             extra={"chain": self.name},
         )
+        
+        # Initialize RPC pool (async — may contact server)
+        self._rpc_pool = await self._init_rpc_pool()
+        self._querier = BinarySearchQuerier(self._rpc_pool)
         
         self._task = asyncio.create_task(self._poll_loop())
     
@@ -97,7 +141,8 @@ class ChainListener:
                 pass
             self._task = None
         
-        await self._rpc_pool.close()
+        if self._rpc_pool:
+            await self._rpc_pool.stop()
         
         logger.info(
             f"Stopped chain listener: {self.name}, last_block={self._last_block}",

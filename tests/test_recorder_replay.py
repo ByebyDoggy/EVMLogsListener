@@ -1,6 +1,5 @@
-"""Tests for LogRecorder and LogReplaySource."""
+"""Tests for LogDbRecorder and LogDbReplaySource."""
 
-import asyncio
 import json
 import os
 from pathlib import Path
@@ -8,8 +7,8 @@ from pathlib import Path
 import pytest
 
 from evm_chain_listener.models import Log
-from evm_chain_listener.recorder import LogRecorder
-from evm_chain_listener.replay import LogReplaySource
+from evm_chain_listener.db_recorder import LogDbRecorder
+from evm_chain_listener.db_replay import LogDbReplaySource
 
 
 # ---------- helpers ----------
@@ -80,12 +79,13 @@ class TestLogFromDict:
         assert log.block_number == 100
 
 
-# ---------- LogRecorder ----------
+# ---------- LogDbRecorder ----------
 
-class TestLogRecorder:
-    def test_write_creates_file(self, tmp_path):
-        rec = LogRecorder(
-            directory=str(tmp_path / "rec"),
+class TestLogDbRecorder:
+    def test_write_creates_database(self, tmp_path):
+        db_path = str(tmp_path / "test.db")
+        rec = LogDbRecorder(
+            db_path=db_path,
             chain_name="ethereum",
             chain_id=1,
         )
@@ -94,53 +94,42 @@ class TestLogRecorder:
         assert written == 2
         rec.close()
 
-        # Find the JSONL file
-        jsonl_files = list((tmp_path / "rec").glob("*.jsonl"))
-        assert len(jsonl_files) == 1
+        assert Path(db_path).exists()
 
-        # Verify content
-        with open(jsonl_files[0]) as f:
-            lines = [json.loads(l) for l in f]
-        assert len(lines) == 2
-        assert lines[0]["block_number"] == "0x64"  # hex format
-        assert lines[0]["_chain_id"] == 1
-        assert lines[0]["_chain_name"] == "ethereum"
-
-    def test_write_manifest(self, tmp_path):
-        rec = LogRecorder(
-            directory=str(tmp_path / "rec"),
+    def test_write_updates_session(self, tmp_path):
+        db_path = str(tmp_path / "test.db")
+        rec = LogDbRecorder(
+            db_path=db_path,
             chain_name="ethereum",
             chain_id=1,
         )
         rec.write([_make_log(block_number=100), _make_log(block_number=200)])
-        path = rec.close()
-        assert path is not None
+        rec.close()
 
-        manifest_files = list((tmp_path / "rec").glob("*.manifest.json"))
-        assert len(manifest_files) == 1
-
-        with open(manifest_files[0]) as f:
-            manifest = json.load(f)
-        assert manifest["chain_name"] == "ethereum"
-        assert manifest["chain_id"] == 1
-        assert manifest["from_block"] == 100
-        assert manifest["to_block"] == 200
-        assert manifest["total_logs"] == 2
+        # Verify session metadata via discover_sessions
+        sessions = LogDbReplaySource.discover_sessions(db_path)
+        assert len(sessions) == 1
+        assert sessions[0]["chain_name"] == "ethereum"
+        assert sessions[0]["chain_id"] == 1
+        assert sessions[0]["from_block"] == 100
+        assert sessions[0]["to_block"] == 200
+        assert sessions[0]["total_logs"] == 2
 
     def test_empty_write(self, tmp_path):
-        rec = LogRecorder(
-            directory=str(tmp_path / "rec"),
+        db_path = str(tmp_path / "test.db")
+        rec = LogDbRecorder(
+            db_path=db_path,
             chain_name="ethereum",
             chain_id=1,
         )
         written = rec.write([])
         assert written == 0
-        path = rec.close()
-        assert path is None  # Nothing written, no file created
+        rec.close()
 
     def test_multiple_writes(self, tmp_path):
-        rec = LogRecorder(
-            directory=str(tmp_path / "rec"),
+        db_path = str(tmp_path / "test.db")
+        rec = LogDbRecorder(
+            db_path=db_path,
             chain_name="ethereum",
             chain_id=1,
         )
@@ -148,44 +137,68 @@ class TestLogRecorder:
         rec.write([_make_log(block_number=200)])
         rec.close()
 
-        jsonl_files = list((tmp_path / "rec").glob("*.jsonl"))
-        assert len(jsonl_files) == 1
-        with open(jsonl_files[0]) as f:
-            lines = f.readlines()
-        assert len(lines) == 2
+        sessions = LogDbReplaySource.discover_sessions(db_path)
+        assert sessions[0]["total_logs"] == 2
+
+    @pytest.mark.asyncio
+    async def test_deduplication(self, tmp_path):
+        """INSERT OR IGNORE should skip duplicate logs."""
+        db_path = str(tmp_path / "test.db")
+        rec = LogDbRecorder(
+            db_path=db_path,
+            chain_name="ethereum",
+            chain_id=1,
+        )
+        log = _make_log(block_number=100, log_index=0, tx_hash="0xsame")
+        rec.write([log])
+        # Write the same log again — should be ignored at DB level
+        rec.write([log])
+        rec.close()
+
+        # Replay and count
+        collected = []
+        source = LogDbReplaySource(
+            db_path=db_path,
+            chain_name="ethereum",
+            chain_id=1,
+            log_callback=lambda logs: collected.extend(logs),
+        )
+        total = await source.replay()
+        assert total == 1
 
     def test_context_manager(self, tmp_path):
-        with LogRecorder(str(tmp_path / "rec"), "eth", 1) as rec:
+        db_path = str(tmp_path / "test.db")
+        with LogDbRecorder(db_path, "eth", 1) as rec:
             rec.write([_make_log(block_number=50)])
-        jsonl_files = list((tmp_path / "rec").glob("*.jsonl"))
-        assert len(jsonl_files) == 1
+        assert Path(db_path).exists()
 
 
-# ---------- LogReplaySource ----------
+# ---------- LogDbReplaySource ----------
 
-class TestLogReplaySource:
+class TestLogDbReplaySource:
     def _create_recording(self, tmp_path, chain_name="ethereum", chain_id=1, num_logs=5):
-        """Helper: create a recording file and return its path."""
-        rec = LogRecorder(
-            directory=str(tmp_path / "rec"),
+        """Helper: create a recording database and return its path."""
+        db_path = str(tmp_path / "test.db")
+        rec = LogDbRecorder(
+            db_path=db_path,
             chain_name=chain_name,
             chain_id=chain_id,
         )
         logs = [_make_log(block_number=100 + i, log_index=i, chain_id=chain_id, chain_name=chain_name) for i in range(num_logs)]
         rec.write(logs)
-        path = rec.close()
-        return path
+        rec.close()
+        return db_path
 
     @pytest.mark.asyncio
     async def test_replay_basic(self, tmp_path):
-        path = self._create_recording(tmp_path, num_logs=5)
+        db_path = self._create_recording(tmp_path, num_logs=5)
         collected = []
 
         def callback(logs):
             collected.extend(logs)
 
-        source = LogReplaySource(
-            file_path=path,
+        source = LogDbReplaySource(
+            db_path=db_path,
             chain_name="ethereum",
             chain_id=1,
             log_callback=callback,
@@ -193,7 +206,7 @@ class TestLogReplaySource:
         total = await source.replay()
         assert total == 5
         assert len(collected) == 5
-        # Verify data structure matches original
+        # Verify data structure
         assert collected[0].address == "0xDeadBeef"
         assert collected[0].block_number == 100
         assert collected[0].chain_id == 1
@@ -201,14 +214,14 @@ class TestLogReplaySource:
 
     @pytest.mark.asyncio
     async def test_replay_with_block_filter(self, tmp_path):
-        path = self._create_recording(tmp_path, num_logs=10)
+        db_path = self._create_recording(tmp_path, num_logs=10)
         collected = []
 
         def callback(logs):
             collected.extend(logs)
 
-        source = LogReplaySource(
-            file_path=path,
+        source = LogDbReplaySource(
+            db_path=db_path,
             chain_name="ethereum",
             chain_id=1,
             log_callback=callback,
@@ -219,8 +232,8 @@ class TestLogReplaySource:
 
     @pytest.mark.asyncio
     async def test_replay_file_not_found(self, tmp_path):
-        source = LogReplaySource(
-            file_path="/nonexistent/file.jsonl",
+        source = LogDbReplaySource(
+            db_path="/nonexistent/file.db",
             chain_name="ethereum",
             chain_id=1,
             log_callback=lambda logs: None,
@@ -230,47 +243,42 @@ class TestLogReplaySource:
 
     @pytest.mark.asyncio
     async def test_replay_batching(self, tmp_path):
-        path = self._create_recording(tmp_path, num_logs=10)
+        """Test block-level batching: each batch contains logs from blocks_per_batch blocks."""
+        db_path = self._create_recording(tmp_path, num_logs=10)
         batches = []
 
         def callback(logs):
             batches.append(list(logs))
 
-        source = LogReplaySource(
-            file_path=path,
+        # 10 logs at blocks 100-109, blocks_per_batch=3 → batches:
+        # [100,101,102], [103,104,105], [106,107,108], [109]
+        source = LogDbReplaySource(
+            db_path=db_path,
             chain_name="ethereum",
             chain_id=1,
             log_callback=callback,
-            batch_size=3,
+            blocks_per_batch=3,
+            batch_interval_seconds=0,  # no delay in tests
         )
         total = await source.replay()
         assert total == 10
-        # Should have 4 batches: 3+3+3+1
         assert len(batches) == 4
+        # First batch: blocks 100,101,102 → 3 logs
         assert len(batches[0]) == 3
+        # Last batch: block 109 → 1 log
         assert len(batches[-1]) == 1
 
-    def test_discover_recordings(self, tmp_path):
-        # Create two recordings
-        self._create_recording(tmp_path, chain_name="ethereum", chain_id=1, num_logs=3)
-        self._create_recording(tmp_path, chain_name="ethereum", chain_id=1, num_logs=2)
+    def test_discover_sessions(self, tmp_path):
+        db_path = self._create_recording(tmp_path, chain_name="ethereum", chain_id=1, num_logs=3)
 
-        results = LogReplaySource.discover_recordings(str(tmp_path / "rec"))
-        assert len(results) >= 2
+        sessions = LogDbReplaySource.discover_sessions(db_path)
+        assert len(sessions) == 1
+        assert sessions[0]["chain_name"] == "ethereum"
+        assert sessions[0]["chain_id"] == 1
 
-    def test_discover_recordings_with_chain_filter(self, tmp_path):
-        self._create_recording(tmp_path, chain_name="ethereum", chain_id=1, num_logs=1)
-        self._create_recording(tmp_path, chain_name="polygon", chain_id=137, num_logs=1)
-
-        results = LogReplaySource.discover_recordings(
-            str(tmp_path / "rec"), chain_name="ethereum"
-        )
-        assert len(results) >= 1
-        assert all(r.get("chain_name") == "ethereum" for r in results)
-
-    def test_discover_nonexistent_directory(self, tmp_path):
-        results = LogReplaySource.discover_recordings(str(tmp_path / "nonexistent"))
-        assert results == []
+    def test_discover_sessions_nonexistent(self, tmp_path):
+        sessions = LogDbReplaySource.discover_sessions(str(tmp_path / "nonexistent.db"))
+        assert sessions == []
 
 
 # ---------- Roundtrip: record then replay ----------
@@ -280,8 +288,8 @@ class TestRecordReplayRoundtrip:
     async def test_full_roundtrip(self, tmp_path):
         """Record logs, then replay them and verify data integrity."""
         # 1. Record
-        rec_dir = str(tmp_path / "recordings")
-        rec = LogRecorder(directory=rec_dir, chain_name="ethereum", chain_id=1)
+        db_path = str(tmp_path / "recordings" / "logs.db")
+        rec = LogDbRecorder(db_path=db_path, chain_name="ethereum", chain_id=1)
 
         original_logs = [
             _make_log(block_number=100, log_index=0, tx_hash="0xtx_a"),
@@ -290,8 +298,7 @@ class TestRecordReplayRoundtrip:
             _make_log(block_number=102, log_index=0, tx_hash="0xtx_d"),
         ]
         rec.write(original_logs)
-        file_path = rec.close()
-        assert file_path is not None
+        rec.close()
 
         # 2. Replay
         replayed = []
@@ -299,8 +306,8 @@ class TestRecordReplayRoundtrip:
         def callback(logs):
             replayed.extend(logs)
 
-        source = LogReplaySource(
-            file_path=file_path,
+        source = LogDbReplaySource(
+            db_path=db_path,
             chain_name="ethereum",
             chain_id=1,
             log_callback=callback,
@@ -325,16 +332,16 @@ class TestRecordReplayRoundtrip:
     @pytest.mark.asyncio
     async def test_roundtrip_with_block_filter(self, tmp_path):
         """Record logs, replay a subset, verify only the subset is returned."""
-        rec_dir = str(tmp_path / "recordings")
-        rec = LogRecorder(directory=rec_dir, chain_name="ethereum", chain_id=1)
+        db_path = str(tmp_path / "recordings" / "logs.db")
+        rec = LogDbRecorder(db_path=db_path, chain_name="ethereum", chain_id=1)
 
         logs = [_make_log(block_number=i) for i in range(100, 110)]
         rec.write(logs)
-        file_path = rec.close()
+        rec.close()
 
         replayed = []
-        source = LogReplaySource(
-            file_path=file_path,
+        source = LogDbReplaySource(
+            db_path=db_path,
             chain_name="ethereum",
             chain_id=1,
             log_callback=lambda l: replayed.extend(l),

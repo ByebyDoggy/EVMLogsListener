@@ -3,44 +3,44 @@ chains:
     chain_id: 1
     poll_interval: 30
     # --- Option A: legacy RPC node pool (per-node priority, rate limit) ---
-    rpc_nodes:
-      - url: "https://ethereum-rpc.publicnode.com"
-        priority: 1
-        type: public
-        rate_limit:
-          requests_per_second: 5
-          burst: 10
-      - url: "https://1rpc.io/eth"
-        priority: 2
-        type: public
-        rate_limit:
-          requests_per_second: 5
-          burst: 10
-      - url: "https://cloudflare-eth.com"
-        priority: 3
-        type: public
-        rate_limit:
-          requests_per_second: 2
-          burst: 5
-      - url: "https://eth.drpc.org"
-        priority: 4
-        type: public
-        rate_limit:
-          requests_per_second: 5
-          burst: 10
-      - url: "https://rpc.ankr.com/eth"
-        priority: 5
-        type: public
-        rate_limit:
-          requests_per_second: 5
-          burst: 10
-    # --- Option B: apipool-ng load balancing (simpler, random round-robin + auto-eviction) ---
-    # apipool_urls:                    # Uncomment to use instead of rpc_nodes
-    #   - "https://ethereum-rpc.publicnode.com"
-    #   - "https://1rpc.io/eth"
-    #   - "https://cloudflare-eth.com"
-    #   - "https://eth.drpc.org"
-    #   - "https://rpc.ankr.com/eth"
+    # rpc_nodes:
+    #   - url: "https://ethereum-rpc.publicnode.com"
+    #     priority: 1
+    #     type: public
+    #     rate_limit:
+    #       requests_per_second: 5
+    #       burst: 10
+    #   - url: "https://1rpc.io/eth"
+    #     priority: 2
+    #     type: public
+    #     rate_limit:
+    #       requests_per_second: 5
+    #       burst: 10
+    #   - url: "https://cloudflare-eth.com"
+    #     priority: 3
+    #     type: public
+    #     rate_limit:
+    #       requests_per_second: 2
+    #       burst: 5
+    #   - url: "https://eth.drpc.org"
+    #     priority: 4
+    #     type: public
+    #     rate_limit:
+    #       requests_per_second: 5
+    #       burst: 10
+    #   - url: "https://rpc.ankr.com/eth"
+    #     priority: 5
+    #     type: public
+    #     rate_limit:
+    #       requests_per_second: 5
+    #       burst: 10
+    # --- Option B: apipool-server auto-load (v1.0.5+) ---
+    # Replace hardcoded URLs with server-managed key list.
+    apipool_server:                        # Uncomment to use instead of rpc_nodes
+      service_url: "http://localhost:8000"  # apipool-server address
+      pool_identifier: "ethereum-rpc"       # Pool identifier on server (keys are resolved via pool membership)
+      username: "user1"                     # Login username
+      password: "12345678"       # Login password (env var supported)
 
 cache:
   max_size: 10000
@@ -60,7 +60,7 @@ health:
 
 alert_processor:
   enabled: true
-  url: "http://localhost:8000"
+  url: "http://localhost:8001"
   push_interval_seconds: 5
   batch_size: 200
   max_payload_mb: 10
@@ -70,22 +70,25 @@ alert_processor:
   reconnect_check_on_startup: true
   replay_endpoint: "/ingest/logs/replay"
 
-# --- Log Recorder: save logs to local JSONL files ---
+# --- Log Recorder: save logs to local SQLite storage ---
 # Enable in realtime or backtest mode to record all incoming logs.
-# Recorded files can later be replayed via the `replay` config.
+# Recorded data can later be replayed via the `replay` config.
 recorder:
   enabled: true                       # Set true to enable recording
-  directory: "./recordings"            # Directory for JSONL files
+  directory: "./recordings"           # Directory for the SQLite database
+  # db_filename: "logs.db"            # SQLite filename (default: logs.db)
 
-# --- Log Replay: load logs from local files instead of RPC ---
+# --- Log Replay: load logs from local SQLite storage instead of RPC ---
 # Only used in backtest mode. When configured, backtest will read logs
-# from local files instead of querying RPC nodes.
+# from a local database instead of querying RPC nodes.
 # replay:
-#   file_path: "./recordings/ethereum_20260409_120000.jsonl"  # Single file mode
-#   # OR directory mode (auto-discovers recordings):
+#   file_path: "./recordings/logs.db"   # SQLite database path
+#   # OR directory mode (auto-discovers .db files):
 #   # directory: "./recordings"
 #   from_block: null                    # Optional block range filter
 #   to_block: null
+#   blocks_per_batch: 2                 # Number of blocks per replay batch (default: 2)
+#   batch_interval_seconds: 5.0         # Seconds to wait between batches (default: 5.0)
 
 # --- Backtest Startup Config ---
 # Only used in backtest mode. When from_block/to_block are set, a backtest
